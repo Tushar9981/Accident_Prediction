@@ -1,97 +1,81 @@
-import os
-import joblib
-import numpy as np
+import time
+
 import pandas as pd
-from sklearn.ensemble import GradientBoostingClassifier
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.metrics import accuracy_score, brier_score_loss, f1_score, log_loss, roc_auc_score
 from sklearn.pipeline import Pipeline
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, classification_report
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
-# 1. GENERATE A REALISTIC 1,000-ROW DATASET FOR TRAINING
-np.random.seed(42)
-n_samples = 1000
+from model_trained import (CATEGORICAL, FEATURES, NUMERIC, TARGET,
+                            AdaptiveAccidentModel, generate_data)
 
-weathers = np.random.choice(['Clear', 'Rain', 'Fog', 'Snow'], size=n_samples, p=[0.5, 0.25, 0.15, 0.10])
-road_conds = []
-for w in weathers:
-    if w == 'Clear':
-        road_conds.append(np.random.choice(['Dry', 'Wet'], p=[0.9, 0.1]))
-    elif w == 'Rain':
-        road_conds.append(np.random.choice(['Wet', 'Dry'], p=[0.85, 0.15]))
-    else:  # Fog or Snow
-        road_conds.append(np.random.choice(['Icy', 'Wet', 'Dry'], p=[0.6, 0.3, 0.1]))
+train_df = generate_data(6000, seed=42)
+test_df = generate_data(2000, seed=99)
 
-times_of_day = np.random.choice(['Day', 'Night'], size=n_samples, p=[0.6, 0.4])
-speed_limits = np.random.choice([25, 35, 45, 55, 65, 70], size=n_samples)
-driver_ages = np.random.randint(18, 75, size=n_samples)
-visibility_km = np.random.uniform(0.5, 10.0, size=n_samples)
+# ---- 1. original approach as baseline -------------------------------------
+base = Pipeline([
+    ("prep", ColumnTransformer([
+        ("cat", OneHotEncoder(handle_unknown="ignore"), CATEGORICAL),
+        ("num", StandardScaler(), NUMERIC)])),
+    ("clf", GradientBoostingClassifier(n_estimators=150, learning_rate=0.08,
+                                       max_depth=4, random_state=42)),
+]).fit(train_df[FEATURES], train_df[TARGET])
+p = base.predict_proba(test_df[FEATURES])[:, 1]
+base_scores = {
+    "auc": roc_auc_score(test_df[TARGET], p),
+    "log_loss": log_loss(test_df[TARGET], p),
+    "brier": brier_score_loss(test_df[TARGET], p),
+    "accuracy": accuracy_score(test_df[TARGET], p >= 0.5),
+    "f1": f1_score(test_df[TARGET], p >= 0.5),
+}
 
-# REALISTIC RISK LOGIC FOR GROUND TRUTH LABELS
-# Risk factors combine additively to create real non-linear risk weights
-risk_score = (
-    (np.array(weathers) == 'Snow') * 2.5 +
-    (np.array(weathers) == 'Fog') * 2.0 +
-    (np.array(weathers) == 'Rain') * 1.2 +
-    (np.array(road_conds) == 'Icy') * 3.0 +
-    (np.array(road_conds) == 'Wet') * 1.5 +
-    (np.array(times_of_day) == 'Night') * 1.3 +
-    (speed_limits / 20.0) +
-    (driver_ages < 22) * 1.8 +
-    (driver_ages > 68) * 1.2 +
-    (10.0 - visibility_km) * 0.4
-)
+# ---- 2. adaptive model -----------------------------------------------------
+t0 = time.time()
+model = AdaptiveAccidentModel().fit(train_df)
+print(f"Trained + tuned in {time.time() - t0:.0f}s | best params: {model.best_params_}")
+new_scores = model.evaluate(test_df)
+model.save()   # keeps v1 on disk, so the later update leaves a rollback point
 
-# Convert score to binary accident severity probability
-prob = 1 / (1 + np.exp(-(risk_score - 7.5)))
-y = (prob > 0.5).astype(int)
+print("\n=== Same data, same test set (lower log_loss/brier = better, higher auc = better) ===")
+print(pd.DataFrame({"original GBC": base_scores, "adaptive model": new_scores}).round(4).to_string())
 
-df = pd.DataFrame({
-    'weather': weathers,
-    'road_condition': road_conds,
-    'time_of_day': times_of_day,
-    'speed_limit': speed_limits,
-    'driver_age': driver_ages,
-    'visibility_km': visibility_km,
-    'accident_severity': y
-})
+print("\n=== What drives risk? (permutation importance) ===")
+print(model.explain(test_df).round(4).to_string())
 
-# 2. SEPARATE FEATURES & TARGET
-X = df.drop(columns=['accident_severity'])
-y = df['accident_severity']
+# ---- 3. the world changes --------------------------------------------------
+drift_test = generate_data(2000, seed=8, drift=True)    # fresh data from the NEW world
+new_batch = generate_data(2000, seed=7, drift=True)     # what we "observed" this month
 
-# 3. BUILD ADVANCED PIPELINE
-categorical_cols = ['weather', 'road_condition', 'time_of_day']
-numerical_cols = ['speed_limit', 'driver_age', 'visibility_km']
+before = model.evaluate(drift_test)
+res = model.update(new_batch)
+after = model.evaluate(drift_test)
 
-preprocessor = ColumnTransformer(
-    transformers=[
-        ('cat', OneHotEncoder(handle_unknown='ignore'), categorical_cols),
-        ('num', StandardScaler(), numerical_cols)
-    ]
-)
+print("\n=== Drift report on the new batch (input PSI: <0.1 stable, >0.2 alert) ===")
+print(pd.Series(res["report"]["psi"]).round(3).to_string())
+print(f"log-loss vs baseline: x{res['report']['loss_ratio']:.2f}  "
+      f"(retrain threshold x{model.loss_alert})")
+print(f"covariate drift: {res['report']['covariate_drift']} | "
+      f"concept drift: {res['report']['concept_drift']}")
+print(f"\nDecision: {res['action']}")
+if "champion_on_fresh" in res:
+    print(f"  old model on held-out fresh data : log_loss={res['champion_on_fresh']['log_loss']:.4f}")
+    print(f"  retrained challenger             : log_loss={res['challenger_on_fresh']['log_loss']:.4f}")
 
-# Gradient Boosting offers high prediction accuracy for complex tabular data
-model_pipeline = Pipeline(steps=[
-    ('preprocessor', preprocessor),
-    ('classifier', GradientBoostingClassifier(
-        n_estimators=150,
-        learning_rate=0.08,
-        max_depth=4,
-        random_state=42
-    ))
-])
+print("\n=== New-world test set: before vs after adapting ===")
+print(pd.DataFrame({"before update": before, "after update": after}).to_string())
+print("\n(Old-world test set after adapting - some drop is expected, the world changed:)")
+print(model.evaluate(test_df))
 
-# 4. TRAIN AND EVALUATE MODEL
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-model_pipeline.fit(X_train, y_train)
+# ---- 4. use it ---------------------------------------------------------------
+scenarios = pd.DataFrame([
+    ("Clear", "Dry", "Day", 45, 35, 9.0),
+    ("Rain", "Wet", "Night", 55, 20, 3.0),
+    ("Fog", "Icy", "Night", 65, 70, 0.8),
+    ("Snow", "Icy", "Day", 35, 45, 2.0),
+], columns=FEATURES)
+print("\n=== Risk predictions ===")
+print(pd.concat([scenarios, model.predict_risk(scenarios)], axis=1).to_string(index=False))
 
-y_pred = model_pipeline.predict(X_test)
-print(f"Model Training Complete!")
-print(f"Test Accuracy: {accuracy_score(y_test, y_pred) * 100:.2f}%\n")
-print("Classification Report:\n", classification_report(y_test, y_pred))
-
-# 5. SAVE HIGH-POWERED MODEL
-joblib.dump(model_pipeline, 'accident_model.joblib')
-print("Powerful new model saved to 'accident_model.joblib'!")
+path = model.save()
+print(f"\nSaved -> {path}  (version {model.version_}; older versions kept in models/)")
